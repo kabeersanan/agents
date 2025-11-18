@@ -18,6 +18,7 @@ from livekit.agents import (
     ModelSettings,
     WorkerOptions,
 )
+#Change-1: Imported rtc from livekit specifically to handle audio data types.
 from livekit import rtc
 from livekit.agents.llm import function_tool
 from livekit.plugins import silero
@@ -25,8 +26,8 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 from .interrupt_handler import SmartInterruptHandler
 
-# uncomment to enable Krisp background voice/noise cancellation
-# from livekit.plugins import noise_cancellation
+# Change-2: enable Krisp background voice/noise cancellation
+from livekit.plugins import noise_cancellation
 
 logger = logging.getLogger("basic-agent")
 
@@ -34,6 +35,7 @@ load_dotenv()
 
 
 class MyAgent(Agent):
+    #Change-3: Storing Interrupt Handler
     def __init__(self, interrupt_handler: SmartInterruptHandler) -> None:
         super().__init__(
             instructions="Your name is Kelly. You would interact with users via voice."
@@ -51,41 +53,49 @@ class MyAgent(Agent):
 
     # all functions annotated with @function_tool will be passed to the LLM when this
     # agent is active
+    
+    #Change-4: This is the function that is responsible for handling speech-to-text problems.
     async def stt_node(
         self,
         audio: AsyncIterable[rtc.AudioFrame],
         model_settings: ModelSettings,
     ) -> AsyncIterable[stt.SpeechEvent]:
         """
-        This custom node intercepts STT events.
-        It filters out filler words before they reach the agent's turn logic.
+        Custom Speech-to-Text (STT) interceptor node.
+        
+        This function sits between the STT provider (Deepgram) and the agent's logic.
+        It filters out "filler" words (e.g., "umm", "uh") only when the agent is speaking,
+        preventing false interruptions while allowing valid commands (e.g., "stop") to pass through.
         """
 
-        # Call the original (default) stt_node to get the speech events
+        # 1. Consume the original stream of speech events from the STT provider
         async for event in super().stt_node(audio, model_settings):
 
-            #
-            # THE FIX IS HERE:
-            # We must check the event.type *FIRST*
-            #
+            # SAFETY CHECK: Defensive programming to prevent crashes.
+            # Some control events (like RECOGNITION_USAGE or START_OF_SPEECH) do not 
+            # have a 'transcript' attribute. We must check for existence before accessing.
+            if not hasattr(event, 'transcript') or not event.transcript:
+                yield event
+                continue
+
+            # 2. Process only FINAL transcripts
+            # We only filter finalized text to avoid chopping up sentences during interim results.
             if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-
-                # *NOW* it is safe to check if event.transcript exists
-                if not event.transcript:
-                    yield event
-                    continue
-
+                
                 text = event.transcript.text
 
-                # Check with our handler if this speech should be processed
+                # 3. Delegate decision logic to the SmartInterruptHandler
+                # If the handler determines this is just filler noise while the agent is talking,
+                # we return False and DROP this event (do not yield it-or not consider it).
                 if not self.interrupt_handler.should_process_transcription(text):
-                    # Handler says IGNORE. So, we log it and do *not*
-                    # yield the event, effectively dropping it.
-                    logger.info(f"MyAgent: Ignoring filler text: {text}")
-                    continue  # Skip to the next event
-
-            # If it's not a final transcript (e.g., interim, start_of_speech)
-            # or the handler says PROCESS, let the event pass through.
+                    logger.info(f"Interruption suppressed: User said '{text}' while agent was speaking.")
+                    continue  # Logic: Explicitly drop the event to ignore the interruption.
+            
+            # 4. Pass through valid events
+            # If we are here, the event is either:
+            #   a) A valid interruption (e.g., "Stop!")
+            #   b) Speech while the agent was listening (not speaking)
+            #   c) An interim transcript update
             yield event
 
 
@@ -118,7 +128,8 @@ def prewarm(proc: JobProcess):
 
 server.setup_fnc = prewarm
 
-
+#Change-5: Entry point for the voice agent: configures the session, 
+# initializes AI models (STT, LLM, TTS), and sets up the interrupt handler.
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
     # each log entry will include these fields
@@ -152,7 +163,7 @@ async def entrypoint(ctx: JobContext):
         false_interruption_timeout=1.0,
     )
 
-    # log metrics as they are emitted, and total usage after session is over
+    # log metrics as they are emitted, and total usage after session is over-helpful to see any problems; beneficial for debugging
     usage_collector = metrics.UsageCollector()
 
     @session.on("metrics_collected")
@@ -181,13 +192,14 @@ async def entrypoint(ctx: JobContext):
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
-                # uncomment to enable the Krisp BVC noise cancellation
-                # noise_cancellation=noise_cancellation.BVC(),
+                #to enable the Krisp BVC noise cancellation
+                noise_cancellation=noise_cancellation.BVC(),
             ),
         ),
     )
 
-
+# Change -6: Main execution block: configures and runs the agent worker with 
+# the defined entrypoint and prewarm functions.
 if __name__ == "__main__":
     opts = WorkerOptions(
         entrypoint_fnc=entrypoint,
