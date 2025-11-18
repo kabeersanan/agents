@@ -1,9 +1,10 @@
 import logging
-
+import os
+from typing import AsyncIterable
 from dotenv import load_dotenv
 
 from livekit.agents import (
-    Agent,
+    Agent,                 
     AgentServer,
     AgentSession,
     JobContext,
@@ -13,10 +14,16 @@ from livekit.agents import (
     cli,
     metrics,
     room_io,
+    stt,             
+    ModelSettings,
+    WorkerOptions,
 )
+from livekit import rtc
 from livekit.agents.llm import function_tool
 from livekit.plugins import silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+from .interrupt_handler import SmartInterruptHandler
 
 # uncomment to enable Krisp background voice/noise cancellation
 # from livekit.plugins import noise_cancellation
@@ -27,7 +34,7 @@ load_dotenv()
 
 
 class MyAgent(Agent):
-    def __init__(self) -> None:
+    def __init__(self, interrupt_handler: SmartInterruptHandler) -> None:
         super().__init__(
             instructions="Your name is Kelly. You would interact with users via voice."
             "with that in mind keep your responses concise and to the point."
@@ -35,6 +42,7 @@ class MyAgent(Agent):
             "You are curious and friendly, and have a sense of humor."
             "you will speak english to the user",
         )
+        self.interrupt_handler = interrupt_handler
 
     async def on_enter(self):
         # when the agent is added to the session, it'll generate a reply
@@ -43,6 +51,35 @@ class MyAgent(Agent):
 
     # all functions annotated with @function_tool will be passed to the LLM when this
     # agent is active
+    async def stt_node(
+        self,
+        audio: AsyncIterable[rtc.AudioFrame],
+        model_settings: ModelSettings,
+    ) -> AsyncIterable[stt.SpeechEvent]:
+        """
+        This custom node intercepts STT events.
+        It filters out filler words before they reach the agent's turn logic.
+        """
+        
+        # Call the original (default) stt_node to get the speech events
+        async for event in super().stt_node(audio, model_settings):
+            
+            # We only care about the final transcript
+            if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                text = event.transcript.text
+                
+                # Check with our handler if this speech should be processed
+                if not self.interrupt_handler.should_process_transcription(text):
+                    # Handler says IGNORE. So, we log it and do *not*
+                    # yield the event, effectively dropping it.
+                    logger.info(f"MyAgent: Ignoring filler text: {text}")
+                    continue  # Skip to the next event
+            
+            # If it's not a final transcript (e.g., interim) or the
+            # handler says PROCESS, let the event pass through.
+            yield event
+
+
     @function_tool
     async def lookup_weather(
         self, context: RunContext, location: str, latitude: str, longitude: str
@@ -79,6 +116,10 @@ async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {
         "room": ctx.room.name,
     }
+    ignored_words_list = os.environ.get("IGNORED_WORDS", "uh,umm,hmm,haan").split(',')
+    ignored_words_set = set(word.strip().lower() for word in ignored_words_list)
+    interrupt_handler = SmartInterruptHandler(ignored_words=ignored_words_set)
+    
     session = AgentSession(
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
         # See all available models at https://docs.livekit.io/agents/models/stt/
@@ -109,6 +150,15 @@ async def entrypoint(ctx: JobContext):
     def _on_metrics_collected(ev: MetricsCollectedEvent):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
+    @session.on("tts_started")
+    def on_tts_started(event):
+        logger.debug("Event: TTS started")
+        interrupt_handler.set_agent_speaking(True)
+
+    @session.on("tts_ended")
+    def on_tts_ended(event):
+        logger.debug("Event: TTS ended")
+        interrupt_handler.set_agent_speaking(False)
 
     async def log_usage():
         summary = usage_collector.get_summary()
@@ -118,7 +168,7 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(log_usage)
 
     await session.start(
-        agent=MyAgent(),
+        agent=MyAgent(interrupt_handler=interrupt_handler),
         room=ctx.room,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
@@ -130,4 +180,8 @@ async def entrypoint(ctx: JobContext):
 
 
 if __name__ == "__main__":
-    cli.run_app(server)
+    opts = WorkerOptions(
+        entrypoint_fnc=entrypoint,
+        prewarm_fnc=prewarm,
+    )
+    cli.run_app(opts)
