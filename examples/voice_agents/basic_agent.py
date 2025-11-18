@@ -60,23 +60,32 @@ class MyAgent(Agent):
         This custom node intercepts STT events.
         It filters out filler words before they reach the agent's turn logic.
         """
-        
+
         # Call the original (default) stt_node to get the speech events
         async for event in super().stt_node(audio, model_settings):
-            
-            # We only care about the final transcript
+
+            #
+            # THE FIX IS HERE:
+            # We must check the event.type *FIRST*
+            #
             if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+
+                # *NOW* it is safe to check if event.transcript exists
+                if not event.transcript:
+                    yield event
+                    continue
+
                 text = event.transcript.text
-                
+
                 # Check with our handler if this speech should be processed
                 if not self.interrupt_handler.should_process_transcription(text):
                     # Handler says IGNORE. So, we log it and do *not*
                     # yield the event, effectively dropping it.
                     logger.info(f"MyAgent: Ignoring filler text: {text}")
                     continue  # Skip to the next event
-            
-            # If it's not a final transcript (e.g., interim) or the
-            # handler says PROCESS, let the event pass through.
+
+            # If it's not a final transcript (e.g., interim, start_of_speech)
+            # or the handler says PROCESS, let the event pass through.
             yield event
 
 
