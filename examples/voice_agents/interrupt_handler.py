@@ -21,6 +21,7 @@ class SmartInterruptHandler:
         
         logger.info(f"InterruptHandler initialized with fillers: {ignored_words}")
 
+
     def set_agent_speaking(self, speaking: bool):
         """
         An event handler will call this to update the agent's speaking state.
@@ -34,12 +35,12 @@ class SmartInterruptHandler:
         Decides if a transcription should be processed or ignored.
         """
         
-        # 1. If the agent is quiet, always process the user's speech [cite: 69]
+        #If the agent is quiet, always process the user's speech [cite: 69]
         if not self._is_agent_speaking:
             logger.debug("Agent is quiet, processing speech.")
             return True
 
-        # 2. If agent is speaking, analyze the transcription
+        # If agent is speaking, analyze the transcription
         normalized_text = self._punctuation_re.sub('', transcription.lower().strip())
         if not normalized_text:
             return False # Ignore empty transcriptions
@@ -49,11 +50,25 @@ class SmartInterruptHandler:
         # Check if ALL words in the transcription are filler words
         is_purely_filler = all(word in self._ignored_words for word in words)
 
-        # 3. If it's purely filler, ignore it [cite: 68]
+        #If it's purely filler, ignore it [cite: 68]
         if is_purely_filler:
             logger.info(f"Ignoring filler interruption: '{transcription}'")
             return False
             
-        # 4. If it contains any non-filler words, it's a valid interruption [cite: 70, 80]
+        #If it contains any non-filler words, it's a valid interruption [cite: 70, 80]
         logger.info(f"Valid interruption detected: '{transcription}'")
         return True
+    
+
+    #Bonus Change: Addition/Removal of the Ignored words dynamically, by instructing agent kelly.
+    def update_ignored_words(self, word: str, action: str) -> str:
+        word = word.lower().strip()
+        if action == "add":
+            self._ignored_words.add(word)
+            logger.info(f"Added '{word}' to ignored list. Current list: {self._ignored_words}")
+            return f"Added '{word}' to the ignored list."
+        elif action == "remove" and word in self._ignored_words:
+            self._ignored_words.remove(word)
+            logger.info(f"Removed '{word}' from ignored list.")
+            return f"Removed '{word}' from the ignored list."
+        return f"Word '{word}' not found in list."

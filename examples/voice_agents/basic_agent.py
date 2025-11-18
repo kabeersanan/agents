@@ -55,6 +55,7 @@ class MyAgent(Agent):
     # agent is active
     
     #Change-4: This is the function that is responsible for handling speech-to-text problems.
+    # also used to filter ignored words from BOTH interim and final results
     async def stt_node(
         self,
         audio: AsyncIterable[rtc.AudioFrame],
@@ -62,43 +63,46 @@ class MyAgent(Agent):
     ) -> AsyncIterable[stt.SpeechEvent]:
         """
         Custom Speech-to-Text (STT) interceptor node.
-        
-        This function sits between the STT provider (Deepgram) and the agent's logic.
-        It filters out "filler" words (e.g., "umm", "uh") only when the agent is speaking,
-        preventing false interruptions while allowing valid commands (e.g., "stop") to pass through.
+        Filters out ignored words early to prevent the agent from reacting to them.
         """
-
-        # 1. Consume the original stream of speech events from the STT provider
         async for event in super().stt_node(audio, model_settings):
-
-            # SAFETY CHECK: Defensive programming to prevent crashes.
-            # Some control events (like RECOGNITION_USAGE or START_OF_SPEECH) do not 
-            # have a 'transcript' attribute. We must check for existence before accessing.
+            
+            # SAFETY CHECK: Ensure event has a transcript
             if not hasattr(event, 'transcript') or not event.transcript:
                 yield event
                 continue
 
-            # 2. Process only FINAL transcripts
-            # We only filter finalized text to avoid chopping up sentences during interim results.
-            if event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+            # CHECK BOTH INTERIM AND FINAL TRANSCRIPTS
+            # We filter interim events too so the agent doesn't start "thinking" 
+            # about a word we intend to ignore.
+            if event.type in (stt.SpeechEventType.FINAL_TRANSCRIPT, stt.SpeechEventType.INTERIM_TRANSCRIPT):
                 
                 text = event.transcript.text
 
-                # 3. Delegate decision logic to the SmartInterruptHandler
-                # If the handler determines this is just filler noise while the agent is talking,
-                # we return False and DROP this event (do not yield it-or not consider it).
+                # Delegate to handler
                 if not self.interrupt_handler.should_process_transcription(text):
-                    logger.info(f"Interruption suppressed: User said '{text}' while agent was speaking.")
-                    continue  # Logic: Explicitly drop the event to ignore the interruption.
+                    # It is a filler word (or looks like one). DROP IT.
+                    # This prevents the agent from seeing "Banana" and reacting.
+                    continue 
             
-            # 4. Pass through valid events
-            # If we are here, the event is either:
-            #   a) A valid interruption (e.g., "Stop!")
-            #   b) Speech while the agent was listening (not speaking)
-            #   c) An interim transcript update
+            # If we get here, it's valid speech. Pass it through.
             yield event
 
-
+        
+    #Bonus Change: Added the api endpoint for dynamic addition/removal of ignored words.
+    @function_tool
+    async def update_settings(self, context: RunContext, action: str, word: str):
+        """
+        Updates the list of ignored filler words dynamically. 
+        Use this when the user explicitly asks to ignore or stop ignoring a specific word.
+        
+        Args:
+            action: Either "add" or "remove".
+            word: The specific word to add or remove from the filter list.
+        """
+        result = self.interrupt_handler.update_ignored_words(word, action)
+        return result
+    
     @function_tool
     async def lookup_weather(
         self, context: RunContext, location: str, latitude: str, longitude: str
@@ -116,7 +120,7 @@ class MyAgent(Agent):
 
         logger.info(f"Looking up weather for {location}")
 
-        return "sunny with a temperature of 70 degrees."
+        return "dry cold weather with a temperature of 21 degrees."
 
 
 server = AgentServer()
@@ -142,20 +146,21 @@ async def entrypoint(ctx: JobContext):
     
     session = AgentSession(
         # Speech-to-text (STT) is your agent's ears, turning the user's speech into text that the LLM can understand
-        # See all available models at https://docs.livekit.io/agents/models/stt/
-        stt="deepgram/nova-3",
+        
+        #Bonus Change: Allows evaluation of Hindi Language as well.
+        stt="deepgram/nova-3:multi",
         # A Large Language Model (LLM) is your agent's brain, processing user input and generating a response
-        # See all available models at https://docs.livekit.io/agents/models/llm/
+       
         llm="openai/gpt-4.1-mini",
         # Text-to-speech (TTS) is your agent's voice, turning the LLM's text into speech that the user can hear
-        # See all available models as well as voice selections at https://docs.livekit.io/agents/models/tts/
+        
         tts="cartesia/sonic-2:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
         # VAD and turn detection are used to determine when the user is speaking and when the agent should respond
-        # See more at https://docs.livekit.io/agents/build/turns
+       
         turn_detection=MultilingualModel(),
         vad=ctx.proc.userdata["vad"],
         # allow the LLM to generate a response while waiting for the end of turn
-        # See more at https://docs.livekit.io/agents/build/audio/#preemptive-generation
+        
         preemptive_generation=True,
         # sometimes background noise could interrupt the agent session, these are considered false positive interruptions
         # when it's detected, you may resume the agent's speech
